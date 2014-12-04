@@ -1,0 +1,192 @@
+#!/bin/bash
+
+set -e
+#set -x
+
+[ -f conf/base.conf ] && . conf/base.conf
+CMD_DOCKER="sudo docker"
+CMD_IP="sudo ip"
+
+pid() {
+    echo $($CMD_DOCKER inspect --format='{{.State.Pid}}' $1)
+}
+
+
+cmd_status()
+{
+    echo "Container: $(eval echo \$${1}_NAME)"
+    echo "  Network: "$(eval echo \$${1}_IP)" via "$(eval echo \$${1}_ROUTE)
+    local ctname=$(eval echo \$${1}_NAME)
+    if $CMD_DOCKER inspect $ctname >/dev/null 2>&1; then
+        local running=$($CMD_DOCKER inspect --format='{{.State.Running}}' $ctname)
+
+        echo "  Created: true"
+        echo "  Running: $running"
+        if [ "$running" == "true" ]; then
+            echo "  ID: $($CMD_DOCKER inspect --format='{{.Id}}' $ctname)"
+            while read line; do
+                echo "  Process: $line"
+            done < <(docker exec $ctname supervisorctl status)
+            echo "  Keepalived State: "$(docker exec $ctname tac /var/log/keepalived.err | egrep -m 1 -o "(MASTER|BACKUP)")
+        fi
+    else
+        echo "  Created: false"
+    fi
+}
+
+
+cmd_network() {
+    local ctname=$(eval echo \$${1}_NAME)
+    local ipaddr=$(eval echo \$${1}_IP)
+    local route=$(eval echo \$${1}_ROUTE)
+    PID=$(pid $ctname)
+    IFACE_GUEST=v${IFACE}pg${PID}
+    if ! ip link | grep -q " $IFACE_GUEST:"; then
+        $CMD_IP link add link $IFACE dev $IFACE_GUEST type macvlan mode bridge
+        $CMD_IP link set $IFACE_GUEST netns $PID
+    fi
+    sudo mkdir -p /var/run/netns
+    sudo ln -sf /proc/$PID/ns/net /var/run/netns/$PID
+    if ! $CMD_IP netns exec $PID ip link | grep -q " $IFACE_CONTAINER:"; then
+        $CMD_IP netns exec $PID ip link set $IFACE_GUEST name $IFACE_CONTAINER
+        $CMD_IP netns exec $PID ip addr add $ipaddr dev $IFACE_CONTAINER
+        $CMD_IP netns exec $PID ip link set $IFACE_CONTAINER up
+        $CMD_IP netns exec $PID ip route replace default via $route
+        which arping > /dev/null 2>&1 \
+            && $CMD_IP netns exec arping -c 1 -A -I $IFACE_CONTAINER $(echo $ipaddr|cut -d/ -f1) > /dev/null 2>&1 \
+            || true
+    fi
+}
+
+
+cmd_run_container() {
+    local ctname=$(eval echo \$${1}_NAME)
+    if ! $CMD_DOCKER inspect $ctname >/dev/null 2>&1; then
+        $CMD_DOCKER run --privileged=true -e VIP=$VIPADDR -d -v /data --name $ctname $IMAGE
+        return
+    fi
+    $CMD_DOCKER inspect --format='{{.State.Running}}' $ctname | grep -q false \
+        && $CMD_DOCKER start $ctname
+}
+
+
+cmd_start_volume() {
+    # gather ip
+    local N=1
+    local ipsv=""
+    while :; do
+        [ -z "$(eval echo \$C${N}_NAME)" ] && break
+        local ctname=$(eval echo \$C${N}_NAME)
+        $CMD_DOCKER inspect $ctname >/dev/null 2>&1 \
+            || (echo container $ctname does not exist && continue)
+        local ip=$(eval echo \$C${N}_IP)
+        ipsv="$ipsv "$(eval echo \$C${N}_IP|cut -d/ -f1)":/data"
+        N=$((N + 1))
+    done
+
+    # peer discovery
+    local N=1
+    while :; do
+        [ -z "$(eval echo \$C${N}_NAME)" ] && break
+        local ctname=$(eval echo \$C${N}_NAME)
+        # http://gluster.org/pipermail/gluster-users.old/2013-December/015416.html
+        $CMD_DOCKER exec $ctname setfattr -x trusted.glusterfs.volume-id /data/ >/dev/null 2>&1
+        $CMD_DOCKER exec $ctname setfattr -x trusted.gfid /data/ >/dev/null 2>&1
+        $CMD_DOCKER exec $C1_NAME gluster peer probe $(eval echo \$C${N}_IP|cut -d/ -f1)
+        N=$((N + 1))
+    done
+    # create volume
+    for i in seq 5; do
+        $CMD_DOCKER exec $C1_NAME gluster volume create volume1 replica $REPLICA transport tcp $ipsv force \
+            | egrep -q "(success|already exists)" && break
+        $CMD_DOCKER exec $C1_NAME setfattr -x trusted.glusterfs.volume-id /data/ >/dev/null 2>&1
+        $CMD_DOCKER exec $C1_NAME setfattr -x trusted.gfid /data/ >/dev/null 2>&1
+        sleep 1
+    done
+
+    # permission
+    local N=1
+    while :; do
+        [ -z "$(eval echo \$C${N}_NAME)" ] && break
+        local ctname=$(eval echo \$C${N}_NAME)
+        $CMD_DOCKER inspect $ctname >/dev/null 2>&1 \
+            || (echo container $ctname does not exist && continue)
+        #$CMD_DOCKER exec $ctname gluster volume set volume1 auth.allow 192.168.*.*
+        $CMD_DOCKER exec $ctname gluster volume set volume1 auth.allow *.*.*.*
+        $CMD_DOCKER exec $ctname gluster volume set volume1 server.allow-insecure on
+        N=$((N + 1))
+    done
+
+    $CMD_DOCKER exec $C1_NAME gluster volume start volume1
+}
+
+
+main() {
+    case $1 in
+        start-containers)
+            local N=1
+            while :; do
+                [ -z "$(eval echo \$C${N}_NAME)" ] && break
+                cmd_run_container "C$N"
+                cmd_network "C$N"
+                N=$((N + 1))
+            done
+            ;;
+        start-volume)
+            cmd_start_volume
+            ;;
+        start-container)
+            shift
+            local N=1
+            while :; do
+                [ -z "$(eval echo \$C${N}_NAME)" ] && break
+                if [ "$(eval echo \$C${N}_NAME)" == "$1" ]; then
+                    cmd_run_container "C$N"
+                    cmd_network "C$N"
+                    break
+                fi
+                N=$((N + 1))
+            done
+            ;;
+        stop-container)
+            shift
+            $CMD_DOCKER stop -t 3 "$1"
+            N=$((N + 1))
+            ;;
+        destroy)
+            local N=1
+            while :; do
+                [ -z "$(eval echo \$C${N}_NAME)" ] && break
+                local ctname=$(eval echo \$C${N}_NAME)
+                $CMD_DOCKER inspect $ctname >/dev/null 2>&1 \
+                    && $CMD_DOCKER rm -f $ctname
+                N=$((N + 1))
+            done
+            ;;
+        mount)
+            shift
+            mkdir -p "$1"
+            sudo mount.glusterfs $VIPADDR:volume1 "$1"
+            ;;
+        exec)
+            shift
+            $CMD_DOCKER inspect $2 >/dev/null 2>&1 \
+                && $CMD_DOCKER exec -it $1 "$@"
+            ;;
+        status)
+            echo "Image: $IMAGE"
+            echo "Host Network Interface: $IFACE"
+            echo "VIP: $VIPADDR"
+            local N=1
+            while :; do
+                [ -z "$(eval echo \$C${N}_NAME)" ] && break
+                cmd_status "C$N"
+                N=$((N + 1))
+            done
+            ;;
+        *)
+            ;;
+    esac
+}
+
+main "$@"
