@@ -1,11 +1,16 @@
 glusterfs-keepalived
 =========================
 
-Start glusterfs and keepalived in the same machine. Modify configure in conf/base.conf such as `VIPADDR`(virtual IP Address), `C?_IP` and `C*_ROUTE` to conform with your environment.
+Docker image for multi-nodes glusterfs and keepalived (HA for glusterfs) via macvlan in the same machine.
+
+Get Started
+--------------------
+
+Start glusterfs and keepalived in the same machine. Modify configure in conf/base.conf such as `VIPADDR`(virtual IP Address), `C*_IP` and `C*_ROUTE` to conform with your environment.
 
 Here is my environment
 
-```
+```bash
 IFACE=eth0
 IFACE_GUEST=eth10
 IFACE_CONTAINER=eth10
@@ -24,7 +29,7 @@ C2_ROUTE=192.168.80.254
 
 Run both containers and start volume
 
-```
+```bash
 $ bin/glusterfs-keepalived start-containers
 50b127fdfbdb3a442faf3c5e3d3f5d4e581570f89c5d6ebf29028b3ca0ea106b
 8f5203ddf3e9592ea8416033d92ea6249d91ee27a311a451a2a73da6f7a52168
@@ -41,7 +46,7 @@ volume start: volume1: success
 
 Check the result
 
-```
+```bash
 $ bin/glusterfs-keepalived status
 Image: dorowu/glusterfs-keepalived
 Host Network Interface: eth0
@@ -66,7 +71,7 @@ Container: gk2
 
 Because the container was configure to connect with macvlan, if you would like to mount glusterfs, you should run mount command in another computer by
 
-```
+```bash
 $ sudo mount.glusterfs 192.168.80.220:volume1 mnt
 ```
 
@@ -75,7 +80,7 @@ failover test
 
 Stop container, then you will see Keepalived State of gk2 is switching to MASTER
 
-```
+```bash
 $bin/glusterfs-keepalived stop-container gk1
 gk1
 $ bin/glusterfs-keepalived status
@@ -97,7 +102,7 @@ Container: gk2
 ```
 
 Swtich to gk1 again
-```
+```bash
 $ bin/glusterfs-keepalived start-container gk1
 $ bin/glusterfs-keepalived stop-container gk2
 $ bin/glusterfs-keepalived start-container gk1
